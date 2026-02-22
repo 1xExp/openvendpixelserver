@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -11,10 +10,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	gormPostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -65,12 +64,6 @@ type Hub struct {
 
 func newHub() *Hub {
 	return &Hub{clients: make(map[string]*WSClient)}
-}
-
-func (h *Hub) add(c *WSClient) {
-	h.mu.Lock()
-	h.clients[c.Wallet] = c
-	h.mu.Unlock()
 }
 
 func (h *Hub) remove(wallet string) {
@@ -136,7 +129,7 @@ func (h *Hub) snapshotPlayers(excludeWallet string) []map[string]interface{} {
 		}
 
 		// Pakai wallet address kalau username kosong
-		username := w[:6] + "..." // Default: wallet address 6 karakter
+		username := w[:6] + "..."
 		if p.Username != nil {
 			username = *p.Username
 		}
@@ -157,9 +150,6 @@ var (
 	db        *gorm.DB
 	jwtSecret string
 	hub       = newHub()
-	upgrader  = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
 )
 
 // ─────────────────────────── main ──────────────────────────────
@@ -188,13 +178,14 @@ func main() {
 
 	go cleanupOfflinePlayers()
 
-	// ── Fiber (REST) ──────────────────────────────────────────
+	// ── Fiber ─────────────────────────────────────────────────
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 	}))
 
+	// REST routes
 	app.Post("/auth/wallet", handleWalletAuth)
 	app.Get("/player/me", authMiddleware, getPlayerProfile)
 	app.Put("/player/me", authMiddleware, updatePlayerProfile)
@@ -205,50 +196,50 @@ func main() {
 	app.Post("/player/disconnect", authMiddleware, playerDisconnect)
 	app.Get("/players/online", authMiddleware, getOnlinePlayers)
 
-	// ── WebSocket (net/http on a different port) ──────────────
-	// Running WS on :8081 and REST on :8080 avoids the
-	// Fiber / net/http shared-listener conflict.
-	wsMux := http.NewServeMux()
-	wsMux.HandleFunc("/ws", handleWebSocket)
-
-	go func() {
-		fmt.Println("🔌 WebSocket listening on ws://localhost:8081/ws")
-		if err := http.ListenAndServe(":8081", wsMux); err != nil {
-			log.Fatal("WS server error:", err)
+	// WebSocket upgrade middleware — validasi token sebelum upgrade
+	app.Use("/ws", func(c *fiber.Ctx) error {
+		token := c.Query("token")
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
 		}
-	}()
+		wallet, err := verifyJWT(token)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+		}
+		// Simpan wallet ke locals supaya bisa diambil di WS handler
+		c.Locals("wallet", wallet)
 
-	fmt.Println("🚀 REST API listening on http://localhost:8080")
-	log.Fatal(app.Listen(":8080"))
+		if websocket.IsWebSocketUpgrade(c) {
+			return c.Next()
+		}
+		return fiber.ErrUpgradeRequired
+	})
+
+	// WebSocket handler — satu port dengan REST
+	app.Get("/ws", websocket.New(handleFiberWebSocket))
+
+	// Railway / production: baca PORT dari env, fallback ke 8080
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("🚀 Server listening on :%s  (REST + WebSocket ws://...:%s/ws)\n", port, port)
+	log.Fatal(app.Listen(":" + port))
 }
 
 // ─────────────────────────── WebSocket handler ─────────────────
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		http.Error(w, "missing token", http.StatusUnauthorized)
-		return
-	}
-	wallet, err := verifyJWT(token)
-	if err != nil {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("❌ WS upgrade failed:", err)
-		return
-	}
+func handleFiberWebSocket(c *websocket.Conn) {
+	wallet := c.Locals("wallet").(string)
 
 	client := &WSClient{
-		Conn:   conn,
+		Conn:   c,
 		Wallet: wallet,
 		Send:   make(chan WSMessage, 256),
 	}
 
-	// If the same wallet reconnects, close the old connection first.
+	// Kalau wallet yang sama reconnect, tutup koneksi lama dulu.
 	hub.mu.Lock()
 	if old, ok := hub.clients[wallet]; ok {
 		old.Conn.Close()
@@ -259,7 +250,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("✅ WS connected: %s  (total: %d)\n", wallet, hub.count())
 
-	// ① Send current player list to the newcomer.
+	// ① Kirim daftar player yang sudah online ke newcomer.
 	go func() {
 		players := hub.snapshotPlayers(wallet)
 		hub.send(wallet, WSMessage{
@@ -269,13 +260,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("📤 init_players → %s  (%d players)\n", wallet, len(players))
 	}()
 
-	// ② Announce newcomer to everyone else.
+	// ② Broadcast player_join ke semua yang lain.
 	go func() {
 		var p Player
 		db.Where("wallet_address = ?", wallet).First(&p)
 
-		// Pakai wallet address kalau username kosong
-		username := wallet[:6] + "..." // Default: wallet address 6 karakter
+		username := wallet[:6] + "..."
 		if p.Username != nil {
 			username = *p.Username
 		}
@@ -293,22 +283,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	go clientWriter(client)
-	clientReader(client) // blocks until disconnect
+	clientReader(client) // blocks sampai disconnect
 }
 
-// clientReader reads messages from the player; cleans up on close.
+// clientReader membaca pesan dari player; cleanup saat koneksi putus.
 func clientReader(client *WSClient) {
 	defer func() {
 		hub.remove(client.Wallet)
 		client.Conn.Close()
 
-		// Mark offline in DB.
+		// Tandai offline di DB.
 		db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
 			"is_online": false,
 			"last_seen": time.Now(),
 		})
 
-		// Broadcast leave to remaining clients.
+		// Broadcast player_leave ke semua yang tersisa.
 		hub.broadcast(WSMessage{
 			Type: "player_leave",
 			Data: map[string]interface{}{"wallet": client.Wallet},
@@ -332,7 +322,7 @@ func clientReader(client *WSClient) {
 				continue
 			}
 
-			// Basic anti-teleport: max 600 px per tick (generous for 0.1 s intervals).
+			// Anti-teleport: max 600 px per tick.
 			var cur Player
 			db.Select("position_x, position_y").Where("wallet_address = ?", client.Wallet).First(&cur)
 			dx := x - cur.PositionX
@@ -340,18 +330,17 @@ func clientReader(client *WSClient) {
 			dist := dx*dx + dy*dy
 			const maxDist = 600 * 600
 			if dist > maxDist {
-				// Reject silently or clamp.
 				continue
 			}
 
-			// Persist position.
+			// Simpan posisi ke DB.
 			db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
 				"position_x": x,
 				"position_y": y,
 				"last_seen":  time.Now(),
 			})
 
-			// Broadcast movement to others.
+			// Broadcast posisi ke player lain.
 			hub.broadcast(WSMessage{
 				Type: "player_move",
 				Data: map[string]interface{}{
@@ -367,7 +356,7 @@ func clientReader(client *WSClient) {
 	}
 }
 
-// clientWriter drains the send channel and writes to WebSocket.
+// clientWriter mengosongkan send channel dan menulis ke WebSocket.
 func clientWriter(client *WSClient) {
 	for msg := range client.Send {
 		if err := client.Conn.WriteJSON(msg); err != nil {
@@ -471,12 +460,10 @@ func getOnlinePlayers(c *fiber.Ctx) error {
 		Select("wallet_address", "position_x", "position_y", "username").Find(&players)
 	result := make([]fiber.Map, 0, len(players))
 	for _, p := range players {
-		// Pakai wallet address kalau username kosong
 		username := p.WalletAddress[:6] + "..."
 		if p.Username != nil {
 			username = *p.Username
 		}
-
 		result = append(result, fiber.Map{
 			"wallet":   p.WalletAddress,
 			"x":        p.PositionX,
