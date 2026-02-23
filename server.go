@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,8 @@ import (
 type Player struct {
 	ID            uint      `gorm:"primarykey" json:"id"`
 	WalletAddress string    `gorm:"unique;not null" json:"wallet_address"`
-	Username      *string   `json:"username"`
+	Username      *string   `gorm:"unique" json:"username"`   // unique lowercase identifier (one-time set)
+	DisplayName   *string   `json:"display_name"`             // case-sensitive display name (changeable)
 	Level         int       `gorm:"default:1" json:"level"`
 	Experience    int       `gorm:"default:0" json:"experience"`
 	Gold          int       `gorm:"default:0" json:"gold"`
@@ -110,6 +112,17 @@ func (h *Hub) send(wallet string, msg WSMessage) {
 	}
 }
 
+// resolveDisplayName returns the best display name for a player.
+func resolveDisplayName(p *Player) string {
+	if p.DisplayName != nil {
+		return *p.DisplayName
+	}
+	if p.Username != nil {
+		return *p.Username
+	}
+	return p.WalletAddress[:6] + "..."
+}
+
 // snapshotPlayers returns a list of all online players except excludeWallet.
 func (h *Hub) snapshotPlayers(excludeWallet string) []map[string]interface{} {
 	h.mu.RLock()
@@ -128,17 +141,11 @@ func (h *Hub) snapshotPlayers(excludeWallet string) []map[string]interface{} {
 			continue
 		}
 
-		// Pakai wallet address kalau username kosong
-		username := w[:6] + "..."
-		if p.Username != nil {
-			username = *p.Username
-		}
-
 		players = append(players, map[string]interface{}{
 			"wallet":   w,
 			"x":        p.PositionX,
 			"y":        p.PositionY,
-			"username": username,
+			"username": resolveDisplayName(&p),
 		})
 	}
 	return players
@@ -196,7 +203,12 @@ func main() {
 	app.Post("/player/disconnect", authMiddleware, playerDisconnect)
 	app.Get("/players/online", authMiddleware, getOnlinePlayers)
 
-	// WebSocket upgrade middleware — validasi token sebelum upgrade
+	// Username routes
+	app.Get("/username/check", checkUsername)
+	app.Post("/username/set", authMiddleware, setUsername)
+	app.Put("/username/display", authMiddleware, updateDisplayName)
+
+	// WebSocket upgrade middleware — validate token before upgrade
 	app.Use("/ws", func(c *fiber.Ctx) error {
 		token := c.Query("token")
 		if token == "" {
@@ -206,7 +218,6 @@ func main() {
 		if err != nil {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
 		}
-		// Simpan wallet ke locals supaya bisa diambil di WS handler
 		c.Locals("wallet", wallet)
 
 		if websocket.IsWebSocketUpgrade(c) {
@@ -215,10 +226,9 @@ func main() {
 		return fiber.ErrUpgradeRequired
 	})
 
-	// WebSocket handler — satu port dengan REST
+	// WebSocket handler — same port as REST
 	app.Get("/ws", websocket.New(handleFiberWebSocket))
 
-	// Railway / production: baca PORT dari env, fallback ke 8080
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -239,7 +249,7 @@ func handleFiberWebSocket(c *websocket.Conn) {
 		Send:   make(chan WSMessage, 256),
 	}
 
-	// Kalau wallet yang sama reconnect, tutup koneksi lama dulu.
+	// If the same wallet reconnects, close the old connection first.
 	hub.mu.Lock()
 	if old, ok := hub.clients[wallet]; ok {
 		old.Conn.Close()
@@ -250,7 +260,7 @@ func handleFiberWebSocket(c *websocket.Conn) {
 
 	fmt.Printf("✅ WS connected: %s  (total: %d)\n", wallet, hub.count())
 
-	// ① Kirim daftar player yang sudah online ke newcomer.
+	// ① Send list of already-online players to the newcomer.
 	go func() {
 		players := hub.snapshotPlayers(wallet)
 		hub.send(wallet, WSMessage{
@@ -260,15 +270,10 @@ func handleFiberWebSocket(c *websocket.Conn) {
 		fmt.Printf("📤 init_players → %s  (%d players)\n", wallet, len(players))
 	}()
 
-	// ② Broadcast player_join ke semua yang lain.
+	// ② Broadcast player_join to everyone else.
 	go func() {
 		var p Player
 		db.Where("wallet_address = ?", wallet).First(&p)
-
-		username := wallet[:6] + "..."
-		if p.Username != nil {
-			username = *p.Username
-		}
 
 		hub.broadcast(WSMessage{
 			Type: "player_join",
@@ -276,29 +281,27 @@ func handleFiberWebSocket(c *websocket.Conn) {
 				"wallet":   wallet,
 				"x":        p.PositionX,
 				"y":        p.PositionY,
-				"username": username,
+				"username": resolveDisplayName(&p),
 			},
 		}, wallet)
 		fmt.Printf("📢 player_join broadcast for %s\n", wallet)
 	}()
 
 	go clientWriter(client)
-	clientReader(client) // blocks sampai disconnect
+	clientReader(client) // blocks until disconnect
 }
 
-// clientReader membaca pesan dari player; cleanup saat koneksi putus.
+// clientReader reads messages from the player; cleans up on disconnect.
 func clientReader(client *WSClient) {
 	defer func() {
 		hub.remove(client.Wallet)
 		client.Conn.Close()
 
-		// Tandai offline di DB.
 		db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
 			"is_online": false,
 			"last_seen": time.Now(),
 		})
 
-		// Broadcast player_leave ke semua yang tersisa.
 		hub.broadcast(WSMessage{
 			Type: "player_leave",
 			Data: map[string]interface{}{"wallet": client.Wallet},
@@ -333,14 +336,12 @@ func clientReader(client *WSClient) {
 				continue
 			}
 
-			// Simpan posisi ke DB.
 			db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
 				"position_x": x,
 				"position_y": y,
 				"last_seen":  time.Now(),
 			})
 
-			// Broadcast posisi ke player lain.
 			hub.broadcast(WSMessage{
 				Type: "player_move",
 				Data: map[string]interface{}{
@@ -356,7 +357,7 @@ func clientReader(client *WSClient) {
 	}
 }
 
-// clientWriter mengosongkan send channel dan menulis ke WebSocket.
+// clientWriter drains the send channel and writes to WebSocket.
 func clientWriter(client *WSClient) {
 	for msg := range client.Send {
 		if err := client.Conn.WriteJSON(msg); err != nil {
@@ -457,18 +458,14 @@ func playerDisconnect(c *fiber.Ctx) error {
 func getOnlinePlayers(c *fiber.Ctx) error {
 	var players []Player
 	db.Where("is_online = ? AND wallet_address != ?", true, c.Locals("wallet")).
-		Select("wallet_address", "position_x", "position_y", "username").Find(&players)
+		Select("wallet_address", "position_x", "position_y", "username", "display_name").Find(&players)
 	result := make([]fiber.Map, 0, len(players))
 	for _, p := range players {
-		username := p.WalletAddress[:6] + "..."
-		if p.Username != nil {
-			username = *p.Username
-		}
 		result = append(result, fiber.Map{
 			"wallet":   p.WalletAddress,
 			"x":        p.PositionX,
 			"y":        p.PositionY,
-			"username": username,
+			"username": resolveDisplayName(&p),
 		})
 	}
 	return c.JSON(fiber.Map{"players": result})
@@ -483,6 +480,131 @@ func cleanupOfflinePlayers() {
 			Update("is_online", false)
 		fmt.Println("🧹 Cleaned up stale online flags")
 	}
+}
+
+// ─────────────────────────── Username handlers ─────────────────
+
+// checkUsername checks if a username is available.
+// GET /username/check?username=foo
+func checkUsername(c *fiber.Ctx) error {
+	username := c.Query("username")
+	if username == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "username required"})
+	}
+
+	matched, _ := regexp.MatchString(`^[a-z0-9]{3,16}$`, username)
+	if !matched {
+		return c.JSON(fiber.Map{
+			"available": false,
+			"error":     "username must be lowercase letters and numbers only (3-16 chars)",
+		})
+	}
+
+	var count int64
+	db.Model(&Player{}).Where("username = ?", username).Count(&count)
+
+	return c.JSON(fiber.Map{
+		"available": count == 0,
+		"username":  username,
+	})
+}
+
+// setUsername sets the username (one-time only) and optional display_name.
+// POST /username/set
+func setUsername(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+
+	type Req struct {
+		Username    string  `json:"username"`
+		DisplayName *string `json:"display_name"`
+	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	matched, _ := regexp.MatchString(`^[a-z0-9]{3,16}$`, req.Username)
+	if !matched {
+		return c.Status(400).JSON(fiber.Map{"error": "username must be lowercase letters and numbers only (3-16 chars)"})
+	}
+
+	if req.DisplayName != nil {
+		matched, _ := regexp.MatchString(`^[A-Za-z0-9]{3,16}$`, *req.DisplayName)
+		if !matched {
+			return c.Status(400).JSON(fiber.Map{"error": "display_name must be letters and numbers only (3-16 chars)"})
+		}
+	}
+
+	var player Player
+	if err := db.Where("wallet_address = ?", wallet).First(&player).Error; err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "player not found"})
+	}
+
+	if player.Username != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "username already set (cannot change)"})
+	}
+
+	var count int64
+	db.Model(&Player{}).Where("username = ?", req.Username).Count(&count)
+	if count > 0 {
+		return c.Status(409).JSON(fiber.Map{"error": "username already taken"})
+	}
+
+	if req.DisplayName != nil {
+		db.Model(&Player{}).Where("display_name = ?", *req.DisplayName).Count(&count)
+		if count > 0 {
+			return c.Status(409).JSON(fiber.Map{"error": "display_name already taken"})
+		}
+	}
+
+	player.Username = &req.Username
+	if req.DisplayName != nil {
+		player.DisplayName = req.DisplayName
+	} else {
+		player.DisplayName = &req.Username
+	}
+
+	if err := db.Save(&player).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to save"})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"player":  player,
+	})
+}
+
+// updateDisplayName updates the display_name (can change anytime).
+// PUT /username/display
+func updateDisplayName(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+
+	type Req struct {
+		DisplayName string `json:"display_name"`
+	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	matched, _ := regexp.MatchString(`^[A-Za-z0-9]{3,16}$`, req.DisplayName)
+	if !matched {
+		return c.Status(400).JSON(fiber.Map{"error": "display_name must be letters and numbers only (3-16 chars)"})
+	}
+
+	var player Player
+	db.Where("wallet_address = ?", wallet).First(&player)
+
+	var count int64
+	db.Model(&Player{}).Where("display_name = ? AND wallet_address != ?", req.DisplayName, wallet).Count(&count)
+	if count > 0 {
+		return c.Status(409).JSON(fiber.Map{"error": "display_name already taken"})
+	}
+
+	player.DisplayName = &req.DisplayName
+	db.Save(&player)
+
+	return c.JSON(fiber.Map{"success": true, "player": player})
 }
 
 // ─────────────────────────── Auth helpers ──────────────────────
