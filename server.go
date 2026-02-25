@@ -296,18 +296,15 @@ func clientReader(client *WSClient) {
 	defer func() {
 		hub.remove(client.Wallet)
 		client.Conn.Close()
-
 		db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
 			"is_online": false,
 			"last_seen": time.Now(),
 		})
-
 		hub.broadcast(WSMessage{
 			Type: "player_leave",
 			Data: map[string]interface{}{"wallet": client.Wallet},
 		}, client.Wallet)
-
-		fmt.Printf("❌ WS disconnected: %s  (remaining: %d)\n", client.Wallet, hub.count())
+		fmt.Printf("❌ WS disconnected: %s\n", client.Wallet)
 	}()
 
 	for {
@@ -317,7 +314,6 @@ func clientReader(client *WSClient) {
 		}
 
 		switch msg.Type {
-
 		case "position":
 			x, okX := msg.Data["x"].(float64)
 			y, okY := msg.Data["y"].(float64)
@@ -351,10 +347,73 @@ func clientReader(client *WSClient) {
 				},
 			}, client.Wallet)
 
+		case "chat":
+			// Handle chat messages
+			message, ok := msg.Data["message"].(string)
+			if !ok || message == "" {
+				continue
+			}
+
+			// Sanitize message (max 200 chars, no XSS)
+			message = sanitizeMessage(message)
+			if len(message) == 0 {
+				continue
+			}
+
+			// Get player info for sender name
+			var player Player
+			db.Where("wallet_address = ?", client.Wallet).First(&player)
+
+			senderName := client.Wallet[:6] + "..."
+			if player.DisplayName != nil {
+				senderName = *player.DisplayName
+			} else if player.Username != nil {
+				senderName = *player.Username
+			}
+
+			// Broadcast to all players (including sender)
+			hub.broadcast(WSMessage{
+				Type: "chat",
+				Data: map[string]interface{}{
+					"wallet":  client.Wallet,
+					"sender":  senderName,
+					"message": message,
+					"time":    time.Now().Unix(),
+				},
+			}, "") // Empty string = broadcast to ALL (including sender)
+
+			fmt.Printf("💬 Chat from %s: %s\n", senderName, message)
+
+			// Optional: Save to database
+			// db.Create(&ChatMessage{
+			//     WalletAddress: client.Wallet,
+			//     Message:       message,
+			// })
+
 		case "heartbeat":
 			db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Update("last_seen", time.Now())
 		}
 	}
+}
+
+// Sanitize chat message
+func sanitizeMessage(msg string) string {
+	// Trim spaces
+	msg = strings.TrimSpace(msg)
+
+	// Max length 200 chars
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+
+	// Remove newlines (single line chat)
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.ReplaceAll(msg, "\r", " ")
+
+	// Basic XSS prevention (strip HTML tags)
+	msg = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(msg, "")
+
+	return msg
 }
 
 // clientWriter drains the send channel and writes to WebSocket.
