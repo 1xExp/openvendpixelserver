@@ -1,118 +1,158 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	gormPostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"game-server/utils"
+	ws "game-server/websocket"
 )
 
-// ─────────────────────────── Models ────────────────────────────
+const DEBUG = true
+
+func dbg(format string, args ...interface{}) {
+	if DEBUG {
+		log.Printf("[DBG] "+format, args...)
+	}
+}
 
 type Player struct {
 	ID            uint      `gorm:"primarykey" json:"id"`
 	WalletAddress string    `gorm:"unique;not null" json:"wallet_address"`
-	Username      *string   `gorm:"unique" json:"username"`   // unique lowercase identifier (one-time set)
-	DisplayName   *string   `json:"display_name"`             // case-sensitive display name (changeable)
+	Username      *string   `gorm:"unique" json:"username"`
+	DisplayName   *string   `json:"display_name"`
 	Level         int       `gorm:"default:1" json:"level"`
 	Experience    int       `gorm:"default:0" json:"experience"`
 	Gold          int       `gorm:"default:0" json:"gold"`
 	PositionX     float64   `gorm:"default:100" json:"position_x"`
 	PositionY     float64   `gorm:"default:100" json:"position_y"`
+	EquippedItem  string    `gorm:"default:''" json:"equipped_item"`
+	IsChopping    bool      `gorm:"default:false" json:"is_chopping"`
 	IsOnline      bool      `gorm:"default:false" json:"is_online"`
 	LastSeen      time.Time `json:"last_seen"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-type Claims struct {
-	WalletAddress string `json:"wallet_address"`
-	jwt.RegisteredClaims
+type PlayerInventory struct {
+	ID     uint   `gorm:"primarykey" json:"id"`
+	Wallet string `gorm:"not null;index" json:"wallet"`
+	ItemID string `gorm:"not null" json:"item_id"`
+	Count  int    `gorm:"default:0" json:"count"`
 }
 
-// ─────────────────────────── WebSocket ─────────────────────────
-
-type WSMessage struct {
-	Type string                 `json:"type"`
-	Data map[string]interface{} `json:"data"`
+type TreeState struct {
+	TreeID      string         `json:"tree_id"`
+	State       string         `json:"state"`
+	ChoppersMap map[string]int `json:"choppers"`
+	RespawnTime time.Time      `json:"respawn_time"`
 }
 
-type WSClient struct {
-	Conn   *websocket.Conn
-	Wallet string
-	Send   chan WSMessage
-	mu     sync.Mutex
-}
+var (
+	db         *gorm.DB
+	jwtSecret  string
+	hub        = ws.NewHub()
+	treesState = make(map[string]*TreeState)
+	treesLock  sync.RWMutex
+)
 
-// ─────────────────────────── Hub ───────────────────────────────
-
-type Hub struct {
-	clients map[string]*WSClient
-	mu      sync.RWMutex
-}
-
-func newHub() *Hub {
-	return &Hub{clients: make(map[string]*WSClient)}
-}
-
-func (h *Hub) remove(wallet string) {
-	h.mu.Lock()
-	if c, ok := h.clients[wallet]; ok {
-		close(c.Send)
-		delete(h.clients, wallet)
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("no .env file, reading from environment")
 	}
-	h.mu.Unlock()
-}
 
-func (h *Hub) count() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
-}
-
-// broadcast sends msg to all clients except excludeWallet.
-func (h *Hub) broadcast(msg WSMessage, excludeWallet string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for wallet, c := range h.clients {
-		if wallet == excludeWallet {
-			continue
-		}
-		select {
-		case c.Send <- msg:
-		default:
-			// drop if buffer full
-		}
+	databaseURL := os.Getenv("DATABASE_URL")
+	jwtSecret = os.Getenv("JWT_SECRET")
+	if databaseURL == "" || jwtSecret == "" {
+		log.Fatal("DATABASE_URL and JWT_SECRET are required")
 	}
-}
 
-// send sends msg to a specific client.
-func (h *Hub) send(wallet string, msg WSMessage) {
-	h.mu.RLock()
-	c, ok := h.clients[wallet]
-	h.mu.RUnlock()
-	if ok {
-		select {
-		case c.Send <- msg:
-		default:
-		}
+	var err error
+	db, err = gorm.Open(gormPostgres.Open(databaseURL), &gorm.Config{PrepareStmt: false})
+	if err != nil {
+		log.Fatal("failed to connect to database:", err)
 	}
+	db.AutoMigrate(&Player{}, &PlayerInventory{})
+	log.Println("connected to postgresql")
+
+	db.Model(&Player{}).Where("is_online = ?", true).Updates(map[string]interface{}{
+		"is_online":   false,
+		"is_chopping": false,
+	})
+
+	ws.CleanupOfflinePlayers(30*time.Second, func() {
+		cutoff := time.Now().Add(-2 * time.Minute)
+		db.Model(&Player{}).Where("is_online = ? AND last_seen < ?", true, cutoff).Updates(map[string]interface{}{
+			"is_online":   false,
+			"is_chopping": false,
+		})
+		dbg("stale online flags cleared")
+	})
+
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+	}))
+
+	app.Post("/auth/wallet", handleWalletAuth)
+	app.Get("/player/me", authMiddleware, getPlayerProfile)
+	app.Put("/player/me", authMiddleware, updatePlayerProfile)
+	app.Post("/player/position", authMiddleware, updatePlayerPosition)
+	app.Post("/player/equipment", authMiddleware, updateEquipment)
+	app.Get("/player/inventory", authMiddleware, getInventory)
+	app.Get("/server/info", getServerInfo)
+	app.Post("/server/join", authMiddleware, joinServer)
+	app.Post("/player/heartbeat", authMiddleware, playerHeartbeat)
+	app.Post("/player/disconnect", authMiddleware, playerDisconnect)
+	app.Get("/players/online", authMiddleware, getOnlinePlayers)
+	app.Get("/username/check", checkUsername)
+	app.Post("/username/set", authMiddleware, setUsername)
+	app.Put("/username/display", authMiddleware, updateDisplayName)
+	app.Post("/tree/start-chop", authMiddleware, startChoppingTree)
+	app.Post("/tree/chop-tick", authMiddleware, chopTreeTick)
+	app.Post("/tree/finish-chop", authMiddleware, finishChoppingTree)
+	app.Get("/tree/state", authMiddleware, getTreeState)
+
+	app.Use("/ws", func(c *fiber.Ctx) error {
+		token := c.Query("token")
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
+		}
+		wallet, err := utils.VerifyJWT(token, jwtSecret)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+		}
+		c.Locals("wallet", wallet)
+		if websocket.IsWebSocketUpgrade(c) {
+			return c.Next()
+		}
+		return fiber.ErrUpgradeRequired
+	})
+
+	app.Get("/ws", websocket.New(handleFiberWebSocket))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("server running on :%s\n", port)
+	log.Fatal(app.Listen(":" + port))
 }
 
-// resolveDisplayName returns the best display name for a player.
 func resolveDisplayName(p *Player) string {
 	if p.DisplayName != nil {
 		return *p.DisplayName
@@ -123,310 +163,92 @@ func resolveDisplayName(p *Player) string {
 	return p.WalletAddress[:6] + "..."
 }
 
-// snapshotPlayers returns a list of all online players except excludeWallet.
-func (h *Hub) snapshotPlayers(excludeWallet string) []map[string]interface{} {
-	h.mu.RLock()
-	wallets := make([]string, 0, len(h.clients))
-	for w := range h.clients {
-		if w != excludeWallet {
-			wallets = append(wallets, w)
-		}
-	}
-	h.mu.RUnlock()
-
-	var players []map[string]interface{}
-	for _, w := range wallets {
-		var p Player
-		if err := db.Where("wallet_address = ?", w).First(&p).Error; err != nil {
-			continue
-		}
-
-		players = append(players, map[string]interface{}{
-			"wallet":   w,
-			"x":        p.PositionX,
-			"y":        p.PositionY,
-			"username": resolveDisplayName(&p),
-		})
-	}
-	return players
-}
-
-// ─────────────────────────── Globals ───────────────────────────
-
-var (
-	db        *gorm.DB
-	jwtSecret string
-	hub       = newHub()
-)
-
-// ─────────────────────────── main ──────────────────────────────
-
-func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️  No .env file found")
-	}
-
-	databaseURL := os.Getenv("DATABASE_URL")
-	jwtSecret = os.Getenv("JWT_SECRET")
-	if databaseURL == "" || jwtSecret == "" {
-		log.Fatal("❌ Missing DATABASE_URL or JWT_SECRET")
-	}
-
-	var err error
-	db, err = gorm.Open(gormPostgres.Open(databaseURL), &gorm.Config{PrepareStmt: false})
-	if err != nil {
-		log.Fatal("❌ Failed to connect to DB:", err)
-	}
-	db.AutoMigrate(&Player{})
-	fmt.Println("✅ Connected to PostgreSQL")
-
-	// Mark all players offline at startup
-	db.Model(&Player{}).Where("is_online = ?", true).Update("is_online", false)
-
-	go cleanupOfflinePlayers()
-
-	// ── Fiber ─────────────────────────────────────────────────
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
-	}))
-
-	// REST routes
-	app.Post("/auth/wallet", handleWalletAuth)
-	app.Get("/player/me", authMiddleware, getPlayerProfile)
-	app.Put("/player/me", authMiddleware, updatePlayerProfile)
-	app.Post("/player/position", authMiddleware, updatePlayerPosition)
-	app.Get("/server/info", getServerInfo)
-	app.Post("/server/join", authMiddleware, joinServer)
-	app.Post("/player/heartbeat", authMiddleware, playerHeartbeat)
-	app.Post("/player/disconnect", authMiddleware, playerDisconnect)
-	app.Get("/players/online", authMiddleware, getOnlinePlayers)
-
-	// Username routes
-	app.Get("/username/check", checkUsername)
-	app.Post("/username/set", authMiddleware, setUsername)
-	app.Put("/username/display", authMiddleware, updateDisplayName)
-
-	// WebSocket upgrade middleware — validate token before upgrade
-	app.Use("/ws", func(c *fiber.Ctx) error {
-		token := c.Query("token")
-		if token == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
-		}
-		wallet, err := verifyJWT(token)
-		if err != nil {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
-		}
-		c.Locals("wallet", wallet)
-
-		if websocket.IsWebSocketUpgrade(c) {
-			return c.Next()
-		}
-		return fiber.ErrUpgradeRequired
-	})
-
-	// WebSocket handler — same port as REST
-	app.Get("/ws", websocket.New(handleFiberWebSocket))
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	fmt.Printf("🚀 Server listening on :%s  (REST + WebSocket ws://...:%s/ws)\n", port, port)
-	log.Fatal(app.Listen(":" + port))
-}
-
-// ─────────────────────────── WebSocket handler ─────────────────
-
 func handleFiberWebSocket(c *websocket.Conn) {
 	wallet := c.Locals("wallet").(string)
 
-	client := &WSClient{
+	client := &ws.WSClient{
 		Conn:   c,
 		Wallet: wallet,
-		Send:   make(chan WSMessage, 256),
+		Send:   make(chan ws.WSMessage, 256),
 	}
 
-	// If the same wallet reconnects, close the old connection first.
-	hub.mu.Lock()
-	if old, ok := hub.clients[wallet]; ok {
-		old.Conn.Close()
-		close(old.Send)
-	}
-	hub.clients[wallet] = client
-	hub.mu.Unlock()
+	hub.Register(wallet, client)
+	dbg("ws connected: %s (total: %d)", wallet, hub.Count())
 
-	fmt.Printf("✅ WS connected: %s  (total: %d)\n", wallet, hub.count())
-
-	// ① Send list of already-online players to the newcomer.
 	go func() {
-		players := hub.snapshotPlayers(wallet)
-		hub.send(wallet, WSMessage{
+		players := hub.SnapshotPlayers(wallet, func(w string) (map[string]interface{}, error) {
+			var p Player
+			if err := db.Where("wallet_address = ?", w).First(&p).Error; err != nil {
+				return nil, err
+			}
+			return map[string]interface{}{
+				"wallet":        w,
+				"x":             p.PositionX,
+				"y":             p.PositionY,
+				"username":      resolveDisplayName(&p),
+				"equipped_item": p.EquippedItem,
+				"is_chopping":   p.IsChopping,
+			}, nil
+		})
+		hub.Send(wallet, ws.WSMessage{
 			Type: "init_players",
 			Data: map[string]interface{}{"players": players},
 		})
-		fmt.Printf("📤 init_players → %s  (%d players)\n", wallet, len(players))
+		dbg("init_players sent to %s (%d players)", wallet, len(players))
 	}()
 
-	// ② Broadcast player_join to everyone else.
 	go func() {
 		var p Player
 		db.Where("wallet_address = ?", wallet).First(&p)
-
-		hub.broadcast(WSMessage{
+		hub.Broadcast(ws.WSMessage{
 			Type: "player_join",
 			Data: map[string]interface{}{
-				"wallet":   wallet,
-				"x":        p.PositionX,
-				"y":        p.PositionY,
-				"username": resolveDisplayName(&p),
+				"wallet":        wallet,
+				"x":             p.PositionX,
+				"y":             p.PositionY,
+				"username":      resolveDisplayName(&p),
+				"equipped_item": p.EquippedItem,
+				"is_chopping":   p.IsChopping,
 			},
 		}, wallet)
-		fmt.Printf("📢 player_join broadcast for %s\n", wallet)
+		dbg("player_join broadcast: %s", wallet)
 	}()
 
-	go clientWriter(client)
-	clientReader(client) // blocks until disconnect
-}
-
-// clientReader reads messages from the player; cleans up on disconnect.
-func clientReader(client *WSClient) {
-	defer func() {
-		hub.remove(client.Wallet)
-		client.Conn.Close()
-		db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
-			"is_online": false,
-			"last_seen": time.Now(),
-		})
-		hub.broadcast(WSMessage{
-			Type: "player_leave",
-			Data: map[string]interface{}{"wallet": client.Wallet},
-		}, client.Wallet)
-		fmt.Printf("❌ WS disconnected: %s\n", client.Wallet)
-	}()
-
-	for {
-		var msg WSMessage
-		if err := client.Conn.ReadJSON(&msg); err != nil {
-			break
-		}
-
-		switch msg.Type {
-		case "position":
-			x, okX := msg.Data["x"].(float64)
-			y, okY := msg.Data["y"].(float64)
-			if !okX || !okY {
-				continue
+	go ws.ClientWriter(client)
+	ws.ClientReader(client, hub,
+		func(w string) (float64, float64, error) {
+			var p Player
+			if err := db.Select("position_x, position_y").Where("wallet_address = ?", w).First(&p).Error; err != nil {
+				return 0, 0, err
 			}
-
-			// Anti-teleport: max 600 px per tick.
-			var cur Player
-			db.Select("position_x, position_y").Where("wallet_address = ?", client.Wallet).First(&cur)
-			dx := x - cur.PositionX
-			dy := y - cur.PositionY
-			dist := dx*dx + dy*dy
-			const maxDist = 600 * 600
-			if dist > maxDist {
-				continue
-			}
-
-			db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Updates(map[string]interface{}{
+			return p.PositionX, p.PositionY, nil
+		},
+		func(w string, x, y float64) {
+			db.Model(&Player{}).Where("wallet_address = ?", w).Updates(map[string]interface{}{
 				"position_x": x,
 				"position_y": y,
 				"last_seen":  time.Now(),
 			})
-
-			hub.broadcast(WSMessage{
-				Type: "player_move",
-				Data: map[string]interface{}{
-					"wallet": client.Wallet,
-					"x":      x,
-					"y":      y,
-				},
-			}, client.Wallet)
-
-		case "chat":
-			// Handle chat messages
-			message, ok := msg.Data["message"].(string)
-			if !ok || message == "" {
-				continue
+		},
+		func(w string) (string, error) {
+			var p Player
+			if err := db.Where("wallet_address = ?", w).First(&p).Error; err != nil {
+				return "", err
 			}
-
-			// Sanitize message (max 200 chars, no XSS)
-			message = sanitizeMessage(message)
-			if len(message) == 0 {
-				continue
-			}
-
-			// Get player info for sender name
-			var player Player
-			db.Where("wallet_address = ?", client.Wallet).First(&player)
-
-			senderName := client.Wallet[:6] + "..."
-			if player.DisplayName != nil {
-				senderName = *player.DisplayName
-			} else if player.Username != nil {
-				senderName = *player.Username
-			}
-
-			// Broadcast to all players (including sender)
-			hub.broadcast(WSMessage{
-				Type: "chat",
-				Data: map[string]interface{}{
-					"wallet":  client.Wallet,
-					"sender":  senderName,
-					"message": message,
-					"time":    time.Now().Unix(),
-				},
-			}, "") // Empty string = broadcast to ALL (including sender)
-
-			fmt.Printf("💬 Chat from %s: %s\n", senderName, message)
-
-			// Optional: Save to database
-			// db.Create(&ChatMessage{
-			//     WalletAddress: client.Wallet,
-			//     Message:       message,
-			// })
-
-		case "heartbeat":
-			db.Model(&Player{}).Where("wallet_address = ?", client.Wallet).Update("last_seen", time.Now())
-		}
-	}
+			return resolveDisplayName(&p), nil
+		},
+		func(w string) {
+			db.Model(&Player{}).Where("wallet_address = ?", w).Updates(map[string]interface{}{
+				"is_online":   false,
+				"is_chopping": false,
+				"last_seen":   time.Now(),
+			})
+		},
+		func(w string) {
+			db.Model(&Player{}).Where("wallet_address = ?", w).Update("last_seen", time.Now())
+		},
+	)
 }
-
-// Sanitize chat message
-func sanitizeMessage(msg string) string {
-	// Trim spaces
-	msg = strings.TrimSpace(msg)
-
-	// Max length 200 chars
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
-
-	// Remove newlines (single line chat)
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	msg = strings.ReplaceAll(msg, "\r", " ")
-
-	// Basic XSS prevention (strip HTML tags)
-	msg = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(msg, "")
-
-	return msg
-}
-
-// clientWriter drains the send channel and writes to WebSocket.
-func clientWriter(client *WSClient) {
-	for msg := range client.Send {
-		if err := client.Conn.WriteJSON(msg); err != nil {
-			break
-		}
-	}
-	client.Conn.Close()
-}
-
-// ─────────────────────────── REST handlers ─────────────────────
 
 func handleWalletAuth(c *fiber.Ctx) error {
 	type Req struct {
@@ -438,13 +260,14 @@ func handleWalletAuth(c *fiber.Ctx) error {
 	if err := c.BodyParser(req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
-	if !verifySignature(req.Address, req.Message, req.Signature) {
+	if !utils.VerifySignature(req.Address, req.Message, req.Signature) {
 		return c.Status(401).JSON(fiber.Map{"error": "invalid signature"})
 	}
 	var player Player
 	db.Where("wallet_address = ?", strings.ToLower(req.Address)).
 		FirstOrCreate(&player, Player{WalletAddress: strings.ToLower(req.Address)})
-	token, _ := generateJWT(player.WalletAddress)
+	token, _ := utils.GenerateJWT(player.WalletAddress, jwtSecret)
+	dbg("auth success: %s", player.WalletAddress)
 	return c.JSON(fiber.Map{"token": token, "player": player})
 }
 
@@ -455,7 +278,9 @@ func getPlayerProfile(c *fiber.Ctx) error {
 }
 
 func updatePlayerProfile(c *fiber.Ctx) error {
-	type Req struct{ Username *string `json:"username"` }
+	type Req struct {
+		Username *string `json:"username"`
+	}
 	req := new(Req)
 	c.BodyParser(req)
 	var player Player
@@ -481,10 +306,47 @@ func updatePlayerPosition(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"success": true})
 }
 
+func updateEquipment(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+	type Req struct {
+		EquippedItem string `json:"equipped_item"`
+	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("equipped_item", req.EquippedItem)
+	hub.Broadcast(ws.WSMessage{
+		Type: "player_equip",
+		Data: map[string]interface{}{
+			"wallet":        wallet,
+			"equipped_item": req.EquippedItem,
+		},
+	}, "")
+	dbg("equipment updated: %s -> %s", wallet, req.EquippedItem)
+	return c.JSON(fiber.Map{"success": true})
+}
+
+func getInventory(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+	var items []PlayerInventory
+	if err := db.Where("wallet = ?", wallet).Find(&items).Error; err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to get inventory"})
+	}
+	result := make([]fiber.Map, 0, len(items))
+	for _, item := range items {
+		result = append(result, fiber.Map{
+			"item_id": item.ItemID,
+			"count":   item.Count,
+		})
+	}
+	return c.JSON(fiber.Map{"inventory": result})
+}
+
 func getServerInfo(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"server_id":    1,
-		"player_count": hub.count(),
+		"player_count": hub.Count(),
 		"max_players":  50,
 		"status":       "online",
 	})
@@ -508,8 +370,9 @@ func playerHeartbeat(c *fiber.Ctx) error {
 
 func playerDisconnect(c *fiber.Ctx) error {
 	db.Model(&Player{}).Where("wallet_address = ?", c.Locals("wallet")).Updates(map[string]interface{}{
-		"is_online": false,
-		"last_seen": time.Now(),
+		"is_online":   false,
+		"is_chopping": false,
+		"last_seen":   time.Now(),
 	})
 	return c.JSON(fiber.Map{"success": true})
 }
@@ -517,40 +380,199 @@ func playerDisconnect(c *fiber.Ctx) error {
 func getOnlinePlayers(c *fiber.Ctx) error {
 	var players []Player
 	db.Where("is_online = ? AND wallet_address != ?", true, c.Locals("wallet")).
-		Select("wallet_address", "position_x", "position_y", "username", "display_name").Find(&players)
+		Select("wallet_address", "position_x", "position_y", "username", "display_name", "equipped_item", "is_chopping").
+		Find(&players)
 	result := make([]fiber.Map, 0, len(players))
 	for _, p := range players {
 		result = append(result, fiber.Map{
-			"wallet":   p.WalletAddress,
-			"x":        p.PositionX,
-			"y":        p.PositionY,
-			"username": resolveDisplayName(&p),
+			"wallet":        p.WalletAddress,
+			"x":             p.PositionX,
+			"y":             p.PositionY,
+			"username":      resolveDisplayName(&p),
+			"equipped_item": p.EquippedItem,
+			"is_chopping":   p.IsChopping,
 		})
 	}
 	return c.JSON(fiber.Map{"players": result})
 }
 
-func cleanupOfflinePlayers() {
-	for {
-		time.Sleep(30 * time.Second)
-		cutoff := time.Now().Add(-2 * time.Minute)
-		db.Model(&Player{}).
-			Where("is_online = ? AND last_seen < ?", true, cutoff).
-			Update("is_online", false)
-		fmt.Println("🧹 Cleaned up stale online flags")
+func startChoppingTree(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+	type Req struct {
+		TreeID string `json:"tree_id"`
 	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	treesLock.Lock()
+	defer treesLock.Unlock()
+
+	tree, exists := treesState[req.TreeID]
+	if !exists {
+		tree = &TreeState{
+			TreeID:      req.TreeID,
+			State:       "idle",
+			ChoppersMap: make(map[string]int),
+		}
+		treesState[req.TreeID] = tree
+	}
+
+	if tree.State == "stump" {
+		if time.Now().Before(tree.RespawnTime) {
+			return c.Status(400).JSON(fiber.Map{
+				"error":      "tree is a stump, not yet respawned",
+				"respawn_at": tree.RespawnTime.Unix(),
+			})
+		}
+		tree.State = "idle"
+		tree.ChoppersMap = make(map[string]int)
+	}
+
+	tree.State = "chopping"
+	tree.ChoppersMap[wallet] = 0
+
+	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", true)
+
+	hub.Broadcast(ws.WSMessage{
+		Type: "tree_state",
+		Data: map[string]interface{}{
+			"tree_id": req.TreeID,
+			"state":   "chopping",
+		},
+	}, "")
+
+	dbg("chop started: %s on tree %s", wallet, req.TreeID)
+	return c.JSON(fiber.Map{"success": true, "tree_state": tree.State})
 }
 
-// ─────────────────────────── Username handlers ─────────────────
+func chopTreeTick(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+	type Req struct {
+		TreeID string `json:"tree_id"`
+	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
 
-// checkUsername checks if a username is available.
-// GET /username/check?username=foo
+	treesLock.Lock()
+	defer treesLock.Unlock()
+
+	tree, exists := treesState[req.TreeID]
+	if !exists || tree.State != "chopping" {
+		return c.Status(400).JSON(fiber.Map{"error": "tree not being chopped"})
+	}
+
+	if _, registered := tree.ChoppersMap[wallet]; !registered {
+		return c.Status(400).JSON(fiber.Map{"error": "not chopping this tree"})
+	}
+
+	woodGained := 0
+	if rand.Float64() < 0.5 {
+		woodGained = 1
+		tree.ChoppersMap[wallet] += woodGained
+	}
+
+	return c.JSON(fiber.Map{
+		"wood_gained": woodGained,
+		"total_wood":  tree.ChoppersMap[wallet],
+	})
+}
+
+func finishChoppingTree(c *fiber.Ctx) error {
+	wallet := c.Locals("wallet").(string)
+	type Req struct {
+		TreeID string `json:"tree_id"`
+	}
+	req := new(Req)
+	if err := c.BodyParser(req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	treesLock.Lock()
+	defer treesLock.Unlock()
+
+	tree, exists := treesState[req.TreeID]
+	if !exists {
+		return c.Status(400).JSON(fiber.Map{"error": "tree not found"})
+	}
+
+	totalWood := tree.ChoppersMap[wallet]
+	tree.State = "stump"
+	tree.RespawnTime = time.Now().Add(10 * time.Second)
+	delete(tree.ChoppersMap, wallet)
+
+	if totalWood > 0 {
+		var inv PlayerInventory
+		err := db.Where("wallet = ? AND item_id = ?", wallet, "wood1").First(&inv).Error
+		if err == gorm.ErrRecordNotFound {
+			inv = PlayerInventory{Wallet: wallet, ItemID: "wood1", Count: totalWood}
+			db.Create(&inv)
+		} else {
+			db.Model(&inv).Update("count", inv.Count+totalWood)
+		}
+	}
+
+	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
+
+	hub.Broadcast(ws.WSMessage{
+		Type: "tree_state",
+		Data: map[string]interface{}{
+			"tree_id":    req.TreeID,
+			"state":      "stump",
+			"respawn_at": tree.RespawnTime.Unix(),
+		},
+	}, "")
+
+	dbg("chop finished: %s on tree %s, wood=%d", wallet, req.TreeID, totalWood)
+	return c.JSON(fiber.Map{
+		"success":    true,
+		"total_wood": totalWood,
+		"tree_state": "stump",
+	})
+}
+
+func getTreeState(c *fiber.Ctx) error {
+	treeID := c.Query("tree_id")
+	if treeID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "tree_id required"})
+	}
+
+	treesLock.Lock()
+	defer treesLock.Unlock()
+
+	tree, exists := treesState[treeID]
+	if !exists {
+		return c.JSON(fiber.Map{"tree_id": treeID, "state": "idle"})
+	}
+
+	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
+		tree.State = "idle"
+		tree.ChoppersMap = make(map[string]int)
+		hub.Broadcast(ws.WSMessage{
+			Type: "tree_state",
+			Data: map[string]interface{}{
+				"tree_id": treeID,
+				"state":   "idle",
+			},
+		}, "")
+		dbg("tree respawned: %s", treeID)
+	}
+
+	resp := fiber.Map{"tree_id": treeID, "state": tree.State}
+	if tree.State == "stump" {
+		resp["respawn_at"] = tree.RespawnTime.Unix()
+	}
+	return c.JSON(resp)
+}
+
 func checkUsername(c *fiber.Ctx) error {
 	username := c.Query("username")
 	if username == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "username required"})
 	}
-
 	matched, _ := regexp.MatchString(`^[a-z0-9]{3,16}$`, username)
 	if !matched {
 		return c.JSON(fiber.Map{
@@ -558,21 +580,13 @@ func checkUsername(c *fiber.Ctx) error {
 			"error":     "username must be lowercase letters and numbers only (3-16 chars)",
 		})
 	}
-
 	var count int64
 	db.Model(&Player{}).Where("username = ?", username).Count(&count)
-
-	return c.JSON(fiber.Map{
-		"available": count == 0,
-		"username":  username,
-	})
+	return c.JSON(fiber.Map{"available": count == 0, "username": username})
 }
 
-// setUsername sets the username (one-time only) and optional display_name.
-// POST /username/set
 func setUsername(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
-
 	type Req struct {
 		Username    string  `json:"username"`
 		DisplayName *string `json:"display_name"`
@@ -581,63 +595,49 @@ func setUsername(c *fiber.Ctx) error {
 	if err := c.BodyParser(req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
-
 	matched, _ := regexp.MatchString(`^[a-z0-9]{3,16}$`, req.Username)
 	if !matched {
 		return c.Status(400).JSON(fiber.Map{"error": "username must be lowercase letters and numbers only (3-16 chars)"})
 	}
-
 	if req.DisplayName != nil {
 		matched, _ := regexp.MatchString(`^[A-Za-z0-9]{3,16}$`, *req.DisplayName)
 		if !matched {
 			return c.Status(400).JSON(fiber.Map{"error": "display_name must be letters and numbers only (3-16 chars)"})
 		}
 	}
-
 	var player Player
 	if err := db.Where("wallet_address = ?", wallet).First(&player).Error; err != nil {
 		return c.Status(404).JSON(fiber.Map{"error": "player not found"})
 	}
-
 	if player.Username != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "username already set (cannot change)"})
 	}
-
 	var count int64
 	db.Model(&Player{}).Where("username = ?", req.Username).Count(&count)
 	if count > 0 {
 		return c.Status(409).JSON(fiber.Map{"error": "username already taken"})
 	}
-
 	if req.DisplayName != nil {
 		db.Model(&Player{}).Where("display_name = ?", *req.DisplayName).Count(&count)
 		if count > 0 {
 			return c.Status(409).JSON(fiber.Map{"error": "display_name already taken"})
 		}
 	}
-
 	player.Username = &req.Username
 	if req.DisplayName != nil {
 		player.DisplayName = req.DisplayName
 	} else {
 		player.DisplayName = &req.Username
 	}
-
 	if err := db.Save(&player).Error; err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "failed to save"})
 	}
-
-	return c.JSON(fiber.Map{
-		"success": true,
-		"player":  player,
-	})
+	dbg("username set: %s -> %s", wallet, req.Username)
+	return c.JSON(fiber.Map{"success": true, "player": player})
 }
 
-// updateDisplayName updates the display_name (can change anytime).
-// PUT /username/display
 func updateDisplayName(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
-
 	type Req struct {
 		DisplayName string `json:"display_name"`
 	}
@@ -645,66 +645,21 @@ func updateDisplayName(c *fiber.Ctx) error {
 	if err := c.BodyParser(req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
-
 	matched, _ := regexp.MatchString(`^[A-Za-z0-9]{3,16}$`, req.DisplayName)
 	if !matched {
 		return c.Status(400).JSON(fiber.Map{"error": "display_name must be letters and numbers only (3-16 chars)"})
 	}
-
 	var player Player
 	db.Where("wallet_address = ?", wallet).First(&player)
-
 	var count int64
 	db.Model(&Player{}).Where("display_name = ? AND wallet_address != ?", req.DisplayName, wallet).Count(&count)
 	if count > 0 {
 		return c.Status(409).JSON(fiber.Map{"error": "display_name already taken"})
 	}
-
 	player.DisplayName = &req.DisplayName
 	db.Save(&player)
-
+	dbg("display_name updated: %s -> %s", wallet, req.DisplayName)
 	return c.JSON(fiber.Map{"success": true, "player": player})
-}
-
-// ─────────────────────────── Auth helpers ──────────────────────
-
-func verifySignature(address, message, signature string) bool {
-	msg := fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(message), message)
-	hash := crypto.Keccak256Hash([]byte(msg))
-	sig, err := hexutil.Decode(signature)
-	if err != nil || len(sig) != 65 {
-		return false
-	}
-	if sig[64] >= 27 {
-		sig[64] -= 27
-	}
-	pubKey, err := crypto.SigToPub(hash.Bytes(), sig)
-	if err != nil || pubKey == nil {
-		return false
-	}
-	return strings.EqualFold(crypto.PubkeyToAddress(*pubKey).Hex(), address)
-}
-
-func generateJWT(wallet string) (string, error) {
-	claims := Claims{
-		WalletAddress: wallet,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(jwtSecret))
-}
-
-func verifyJWT(tokenString string) (string, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		return []byte(jwtSecret), nil
-	})
-	if err != nil || !token.Valid {
-		return "", err
-	}
-	return token.Claims.(*Claims).WalletAddress, nil
 }
 
 func authMiddleware(c *fiber.Ctx) error {
@@ -712,12 +667,10 @@ func authMiddleware(c *fiber.Ctx) error {
 	if authHeader == "" {
 		return c.Status(401).JSON(fiber.Map{"error": "missing auth"})
 	}
-	token, err := jwt.ParseWithClaims(strings.TrimPrefix(authHeader, "Bearer "), &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		return []byte(jwtSecret), nil
-	})
-	if err != nil || !token.Valid {
+	token, err := utils.ParseJWT(strings.TrimPrefix(authHeader, "Bearer "), jwtSecret)
+	if err != nil {
 		return c.Status(401).JSON(fiber.Map{"error": "invalid token"})
 	}
-	c.Locals("wallet", token.Claims.(*Claims).WalletAddress)
+	c.Locals("wallet", token)
 	return c.Next()
 }
