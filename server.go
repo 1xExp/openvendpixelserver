@@ -430,11 +430,13 @@ func startChoppingTree(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			})
 		}
+		// Sudah bisa respawn
 		tree.State     = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 	}
 
+	// Izinkan join baik saat idle maupun chopping
 	tree.State = "chopping"
 	if _, ok := tree.DamageMap[wallet]; !ok {
 		tree.DamageMap[wallet] = 0
@@ -447,8 +449,13 @@ func startChoppingTree(c *fiber.Ctx) error {
 		Data: map[string]interface{}{"tree_id": req.TreeID, "state": "chopping"},
 	}, "")
 
-	dbg("chop started: %s on tree %s (hp=%d)", wallet, req.TreeID, tree.CurrentHP)
-	return c.JSON(fiber.Map{"success": true, "current_hp": tree.CurrentHP, "max_hp": tree.MaxHP})
+	dbg("chop joined: %s on tree %s (hp=%d/%d, choppers=%d)",
+		wallet, req.TreeID, tree.CurrentHP, tree.MaxHP, len(tree.DamageMap))
+	return c.JSON(fiber.Map{
+		"success":    true,
+		"current_hp": tree.CurrentHP,
+		"max_hp":     tree.MaxHP,
+	})
 }
 
 func chopTreeTick(c *fiber.Ctx) error {
