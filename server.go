@@ -56,7 +56,9 @@ type PlayerInventory struct {
 type TreeState struct {
 	TreeID      string         `json:"tree_id"`
 	State       string         `json:"state"`
-	ChoppersMap map[string]int `json:"choppers"`
+	MaxHP       int            `json:"max_hp"`
+	CurrentHP   int            `json:"current_hp"`
+	DamageMap   map[string]int `json:"damage_map"` // wallet -> total damage
 	RespawnTime time.Time      `json:"respawn_time"`
 }
 
@@ -396,6 +398,53 @@ func getOnlinePlayers(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"players": result})
 }
 
+// Helper: proses tree tumbang, hitung reward, simpan ke DB
+func _fellTree(tree *TreeState) {
+	tree.State = "stump"
+	tree.RespawnTime = time.Now().Add(10 * time.Second)
+
+	totalDamage := 0
+	for _, d := range tree.DamageMap {
+		totalDamage += d
+	}
+
+	for wallet, damage := range tree.DamageMap {
+		if totalDamage == 0 {
+			break
+		}
+		contribution := float64(damage) / float64(totalDamage) * 100.0
+		if contribution < 10.0 {
+			dbg("reward skipped: %s contrib=%.1f%%", wallet, contribution)
+			continue
+		}
+		// Wood reward proporsional, max 5
+		wood := int(contribution / 100.0 * 5)
+		if wood < 1 {
+			wood = 1
+		}
+		var inv PlayerInventory
+		err := db.Where("wallet = ? AND item_id = ?", wallet, "wood1").First(&inv).Error
+		if err == gorm.ErrRecordNotFound {
+			inv = PlayerInventory{Wallet: wallet, ItemID: "wood1", Count: wood}
+			db.Create(&inv)
+		} else {
+			db.Model(&inv).Update("count", inv.Count+wood)
+		}
+		db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
+		dbg("reward: %s contrib=%.1f%% wood=%d", wallet, contribution, wood)
+	}
+
+	tree.DamageMap = make(map[string]int)
+	hub.Broadcast(ws.WSMessage{
+		Type: "tree_state",
+		Data: map[string]interface{}{
+			"tree_id":    tree.TreeID,
+			"state":      "stump",
+			"respawn_at": tree.RespawnTime.Unix(),
+		},
+	}, "")
+}
+
 func startChoppingTree(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
 	type Req struct {
@@ -412,9 +461,11 @@ func startChoppingTree(c *fiber.Ctx) error {
 	tree, exists := treesState[req.TreeID]
 	if !exists {
 		tree = &TreeState{
-			TreeID:      req.TreeID,
-			State:       "idle",
-			ChoppersMap: make(map[string]int),
+			TreeID:    req.TreeID,
+			State:     "idle",
+			MaxHP:     100,
+			CurrentHP: 100,
+			DamageMap: make(map[string]int),
 		}
 		treesState[req.TreeID] = tree
 	}
@@ -422,29 +473,29 @@ func startChoppingTree(c *fiber.Ctx) error {
 	if tree.State == "stump" {
 		if time.Now().Before(tree.RespawnTime) {
 			return c.Status(400).JSON(fiber.Map{
-				"error":      "tree is a stump, not yet respawned",
+				"error":      "tree is a stump",
 				"respawn_at": tree.RespawnTime.Unix(),
 			})
 		}
 		tree.State = "idle"
-		tree.ChoppersMap = make(map[string]int)
+		tree.CurrentHP = tree.MaxHP
+		tree.DamageMap = make(map[string]int)
 	}
 
 	tree.State = "chopping"
-	tree.ChoppersMap[wallet] = 0
+	if _, ok := tree.DamageMap[wallet]; !ok {
+		tree.DamageMap[wallet] = 0
+	}
 
 	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", true)
 
 	hub.Broadcast(ws.WSMessage{
 		Type: "tree_state",
-		Data: map[string]interface{}{
-			"tree_id": req.TreeID,
-			"state":   "chopping",
-		},
+		Data: map[string]interface{}{"tree_id": req.TreeID, "state": "chopping"},
 	}, "")
 
-	dbg("chop started: %s on tree %s", wallet, req.TreeID)
-	return c.JSON(fiber.Map{"success": true, "tree_state": tree.State})
+	dbg("chop started: %s on tree %s (hp=%d)", wallet, req.TreeID, tree.CurrentHP)
+	return c.JSON(fiber.Map{"success": true, "current_hp": tree.CurrentHP, "max_hp": tree.MaxHP})
 }
 
 func chopTreeTick(c *fiber.Ctx) error {
@@ -465,19 +516,28 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "tree not being chopped"})
 	}
 
-	if _, registered := tree.ChoppersMap[wallet]; !registered {
+	if _, ok := tree.DamageMap[wallet]; !ok {
 		return c.Status(400).JSON(fiber.Map{"error": "not chopping this tree"})
 	}
 
-	woodGained := 0
-	if rand.Float64() < 0.5 {
-		woodGained = 1
-		tree.ChoppersMap[wallet] += woodGained
+	// Damage per tick: 1-3
+	damage := rand.Intn(3) + 1
+	tree.DamageMap[wallet] += damage
+	tree.CurrentHP -= damage
+	if tree.CurrentHP < 0 {
+		tree.CurrentHP = 0
+	}
+
+	fell := tree.CurrentHP <= 0
+	if fell {
+		_fellTree(tree)
 	}
 
 	return c.JSON(fiber.Map{
-		"wood_gained": woodGained,
-		"total_wood":  tree.ChoppersMap[wallet],
+		"damage":     damage,
+		"current_hp": tree.CurrentHP,
+		"max_hp":     tree.MaxHP,
+		"fell":       fell,
 	})
 }
 
@@ -499,38 +559,15 @@ func finishChoppingTree(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "tree not found"})
 	}
 
-	totalWood := tree.ChoppersMap[wallet]
-	tree.State = "stump"
-	tree.RespawnTime = time.Now().Add(10 * time.Second)
-	delete(tree.ChoppersMap, wallet)
-
-	if totalWood > 0 {
-		var inv PlayerInventory
-		err := db.Where("wallet = ? AND item_id = ?", wallet, "wood1").First(&inv).Error
-		if err == gorm.ErrRecordNotFound {
-			inv = PlayerInventory{Wallet: wallet, ItemID: "wood1", Count: totalWood}
-			db.Create(&inv)
-		} else {
-			db.Model(&inv).Update("count", inv.Count+totalWood)
-		}
-	}
-
+	// Player stop chop sebelum pohon tumbang — hapus dari chopper list
+	delete(tree.DamageMap, wallet)
 	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
 
-	hub.Broadcast(ws.WSMessage{
-		Type: "tree_state",
-		Data: map[string]interface{}{
-			"tree_id":    req.TreeID,
-			"state":      "stump",
-			"respawn_at": tree.RespawnTime.Unix(),
-		},
-	}, "")
-
-	dbg("chop finished: %s on tree %s, wood=%d", wallet, req.TreeID, totalWood)
+	dbg("finish-chop: %s left tree %s (hp=%d)", wallet, req.TreeID, tree.CurrentHP)
 	return c.JSON(fiber.Map{
 		"success":    true,
-		"total_wood": totalWood,
-		"tree_state": "stump",
+		"tree_state": tree.State,
+		"current_hp": tree.CurrentHP,
 	})
 }
 
@@ -550,7 +587,8 @@ func getTreeState(c *fiber.Ctx) error {
 
 	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
 		tree.State = "idle"
-		tree.ChoppersMap = make(map[string]int)
+		tree.CurrentHP = tree.MaxHP
+		tree.DamageMap = make(map[string]int)
 		hub.Broadcast(ws.WSMessage{
 			Type: "tree_state",
 			Data: map[string]interface{}{
@@ -561,7 +599,12 @@ func getTreeState(c *fiber.Ctx) error {
 		dbg("tree respawned: %s", treeID)
 	}
 
-	resp := fiber.Map{"tree_id": treeID, "state": tree.State}
+	resp := fiber.Map{
+		"tree_id":    treeID,
+		"state":      tree.State,
+		"current_hp": tree.CurrentHP,
+		"max_hp":     tree.MaxHP,
+	}
 	if tree.State == "stump" {
 		resp["respawn_at"] = tree.RespawnTime.Unix()
 	}
