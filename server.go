@@ -398,53 +398,6 @@ func getOnlinePlayers(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"players": result})
 }
 
-// Helper: proses tree tumbang, hitung reward, simpan ke DB
-func _fellTree(tree *TreeState) {
-	tree.State = "stump"
-	tree.RespawnTime = time.Now().Add(10 * time.Second)
-
-	totalDamage := 0
-	for _, d := range tree.DamageMap {
-		totalDamage += d
-	}
-
-	for wallet, damage := range tree.DamageMap {
-		if totalDamage == 0 {
-			break
-		}
-		contribution := float64(damage) / float64(totalDamage) * 100.0
-		if contribution < 10.0 {
-			dbg("reward skipped: %s contrib=%.1f%%", wallet, contribution)
-			continue
-		}
-		// Wood reward proporsional, max 5
-		wood := int(contribution / 100.0 * 5)
-		if wood < 1 {
-			wood = 1
-		}
-		var inv PlayerInventory
-		err := db.Where("wallet = ? AND item_id = ?", wallet, "wood1").First(&inv).Error
-		if err == gorm.ErrRecordNotFound {
-			inv = PlayerInventory{Wallet: wallet, ItemID: "wood1", Count: wood}
-			db.Create(&inv)
-		} else {
-			db.Model(&inv).Update("count", inv.Count+wood)
-		}
-		db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
-		dbg("reward: %s contrib=%.1f%% wood=%d", wallet, contribution, wood)
-	}
-
-	tree.DamageMap = make(map[string]int)
-	hub.Broadcast(ws.WSMessage{
-		Type: "tree_state",
-		Data: map[string]interface{}{
-			"tree_id":    tree.TreeID,
-			"state":      "stump",
-			"respawn_at": tree.RespawnTime.Unix(),
-		},
-	}, "")
-}
-
 func startChoppingTree(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
 	type Req struct {
@@ -477,7 +430,7 @@ func startChoppingTree(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			})
 		}
-		tree.State = "idle"
+		tree.State     = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 	}
@@ -520,7 +473,6 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "not chopping this tree"})
 	}
 
-	// Damage per tick: 1-3
 	damage := rand.Intn(3) + 1
 	tree.DamageMap[wallet] += damage
 	tree.CurrentHP -= damage
@@ -529,15 +481,54 @@ func chopTreeTick(c *fiber.Ctx) error {
 	}
 
 	fell := tree.CurrentHP <= 0
+	woodRewards := make(map[string]int) // wallet -> wood reward
+
 	if fell {
-		_fellTree(tree)
+		totalDamage := 0
+		for _, d := range tree.DamageMap {
+			totalDamage += d
+		}
+		for w, d := range tree.DamageMap {
+			contrib := float64(d) / float64(totalDamage) * 100.0
+			if contrib < 10.0 {
+				dbg("skip reward: %s contrib=%.1f%%", w, contrib)
+				continue
+			}
+			wood := int(contrib/100.0*5 + 0.5)
+			if wood < 1 {
+				wood = 1
+			}
+			woodRewards[w] = wood
+			var inv PlayerInventory
+			err := db.Where("wallet = ? AND item_id = ?", w, "wood1").First(&inv).Error
+			if err == gorm.ErrRecordNotFound {
+				inv = PlayerInventory{Wallet: w, ItemID: "wood1", Count: wood}
+				db.Create(&inv)
+			} else {
+				db.Model(&inv).Update("count", inv.Count+wood)
+			}
+			db.Model(&Player{}).Where("wallet_address = ?", w).Update("is_chopping", false)
+			dbg("reward: %s contrib=%.1f%% wood=%d", w, contrib, wood)
+		}
+		tree.State       = "stump"
+		tree.RespawnTime = time.Now().Add(10 * time.Second)
+		tree.DamageMap   = make(map[string]int)
+		hub.Broadcast(ws.WSMessage{
+			Type: "tree_state",
+			Data: map[string]interface{}{
+				"tree_id":    req.TreeID,
+				"state":      "stump",
+				"respawn_at": tree.RespawnTime.Unix(),
+			},
+		}, "")
 	}
 
 	return c.JSON(fiber.Map{
-		"damage":     damage,
-		"current_hp": tree.CurrentHP,
-		"max_hp":     tree.MaxHP,
-		"fell":       fell,
+		"damage":      damage,
+		"current_hp":  tree.CurrentHP,
+		"max_hp":      tree.MaxHP,
+		"fell":        fell,
+		"wood_reward": woodRewards[wallet], // 0 jika belum tumbang atau tidak dapat reward
 	})
 }
 
@@ -586,7 +577,7 @@ func getTreeState(c *fiber.Ctx) error {
 	}
 
 	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
-		tree.State = "idle"
+		tree.State     = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 		hub.Broadcast(ws.WSMessage{
