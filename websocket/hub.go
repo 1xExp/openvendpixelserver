@@ -190,6 +190,20 @@ func ClientReader(
 				},
 			}, client.Wallet)
 
+		case "chopping":
+			isChopping, ok := msg.Data["is_chopping"].(bool)
+			if !ok {
+				continue
+			}
+			hub.Broadcast(WSMessage{
+				Type: "player_chopping",
+				Data: map[string]interface{}{
+					"wallet":      client.Wallet,
+					"is_chopping": isChopping,
+				},
+			}, client.Wallet)
+			dbg("chopping broadcast: %s -> %v", client.Wallet, isChopping)
+
 		case "chat":
 			message, ok := msg.Data["message"].(string)
 			if !ok || message == "" {
