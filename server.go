@@ -66,7 +66,7 @@ var (
 	jwtSecret  string
 	hub        = ws.NewHub()
 	treesState = make(map[string]*TreeState)
-	treesLock  sync.RWMutex
+	treesLock  sync.Mutex
 )
 
 func main() {
@@ -239,12 +239,24 @@ func handleFiberWebSocket(c *websocket.Conn) {
 			return resolveDisplayName(&p), nil
 		},
 		func(w string) {
-			// On disconnect: remove from any active chop sessions
+			// On disconnect: bersihkan dari DamageMap semua tree aktif
 			treesLock.Lock()
 			for _, tree := range treesState {
 				if _, ok := tree.DamageMap[w]; ok {
 					delete(tree.DamageMap, w)
 					dbg("removed disconnected player %s from tree %s", w, tree.TreeID)
+					// Kalau tidak ada chopper lagi, kembalikan ke idle
+					if tree.State == "chopping" && len(tree.DamageMap) == 0 {
+						tree.State = "idle"
+						hub.Broadcast(ws.WSMessage{
+							Type: "tree_state",
+							Data: map[string]interface{}{
+								"tree_id": tree.TreeID,
+								"state":   "idle",
+							},
+						}, "")
+						dbg("tree reverted to idle (no choppers): %s", tree.TreeID)
+					}
 				}
 			}
 			treesLock.Unlock()
@@ -382,12 +394,21 @@ func playerHeartbeat(c *fiber.Ctx) error {
 func playerDisconnect(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
 
-	// Remove from any active chop sessions on clean disconnect too
 	treesLock.Lock()
 	for _, tree := range treesState {
 		if _, ok := tree.DamageMap[wallet]; ok {
 			delete(tree.DamageMap, wallet)
-			dbg("removed disconnecting player %s from tree %s", wallet, tree.TreeID)
+			if tree.State == "chopping" && len(tree.DamageMap) == 0 {
+				tree.State = "idle"
+				hub.Broadcast(ws.WSMessage{
+					Type: "tree_state",
+					Data: map[string]interface{}{
+						"tree_id": tree.TreeID,
+						"state":   "idle",
+					},
+				}, "")
+				dbg("tree reverted to idle on disconnect: %s", tree.TreeID)
+			}
 		}
 	}
 	treesLock.Unlock()
@@ -488,12 +509,11 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
 
-	// Anti-cheat: clamp damage per tick
+	// Anti-cheat: clamp damage
 	damage := req.Damage
 	if damage <= 0 || damage > 20 {
 		damage = 10
 	}
-	dbg("chop-tick: wallet=%s tree=%s damage=%d", wallet, req.TreeID, damage)
 
 	treesLock.Lock()
 	defer treesLock.Unlock()
@@ -503,7 +523,7 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "tree not being chopped"})
 	}
 
-	// FIX: reject wallets that never called start-chop
+	// Tolak wallet yang tidak pernah start-chop
 	if _, ok := tree.DamageMap[wallet]; !ok {
 		return c.Status(403).JSON(fiber.Map{"error": "not authorized to chop this tree"})
 	}
@@ -514,6 +534,9 @@ func chopTreeTick(c *fiber.Ctx) error {
 		tree.CurrentHP = 0
 	}
 
+	dbg("chop-tick: %s tree=%s dmg=%d hp=%d/%d",
+		wallet, req.TreeID, damage, tree.CurrentHP, tree.MaxHP)
+
 	fell := tree.CurrentHP <= 0
 	woodRewards := make(map[string]int)
 
@@ -522,6 +545,7 @@ func chopTreeTick(c *fiber.Ctx) error {
 		for _, d := range tree.DamageMap {
 			totalDamage += d
 		}
+
 		for w, d := range tree.DamageMap {
 			contrib := float64(d) / float64(totalDamage) * 100.0
 			if contrib < 10.0 {
@@ -533,6 +557,8 @@ func chopTreeTick(c *fiber.Ctx) error {
 				wood = 1
 			}
 			woodRewards[w] = wood
+
+			// Simpan ke DB
 			var inv PlayerInventory
 			err := db.Where("wallet = ? AND item_id = ?", w, "wood1").First(&inv).Error
 			if err == gorm.ErrRecordNotFound {
@@ -543,10 +569,24 @@ func chopTreeTick(c *fiber.Ctx) error {
 			}
 			db.Model(&Player{}).Where("wallet_address = ?", w).Update("is_chopping", false)
 			dbg("reward: %s contrib=%.1f%% wood=%d", w, contrib, wood)
+
+			// Kirim tree_fell hanya ke wallet yang dapat reward
+			hub.Send(w, ws.WSMessage{
+				Type: "tree_fell",
+				Data: map[string]interface{}{
+					"tree_id":     req.TreeID,
+					"wood_reward": wood,
+				},
+			})
 		}
+
+		// Update state
 		tree.State = "stump"
 		tree.RespawnTime = time.Now().Add(10 * time.Second)
+		savedTreeID := req.TreeID
 		tree.DamageMap = make(map[string]int)
+
+		// Broadcast stump ke semua (untuk visual)
 		hub.Broadcast(ws.WSMessage{
 			Type: "tree_state",
 			Data: map[string]interface{}{
@@ -555,7 +595,29 @@ func chopTreeTick(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			},
 		}, "")
-		dbg("pine tree fell: %s", req.TreeID)
+
+		// Auto respawn setelah 10 detik via goroutine
+		go func() {
+			time.Sleep(10 * time.Second)
+			treesLock.Lock()
+			defer treesLock.Unlock()
+			t, ok := treesState[savedTreeID]
+			if ok && t.State == "stump" && time.Now().After(t.RespawnTime) {
+				t.State = "idle"
+				t.CurrentHP = t.MaxHP
+				t.DamageMap = make(map[string]int)
+				hub.Broadcast(ws.WSMessage{
+					Type: "tree_state",
+					Data: map[string]interface{}{
+						"tree_id": savedTreeID,
+						"state":   "idle",
+					},
+				}, "")
+				dbg("tree respawned: %s", savedTreeID)
+			}
+		}()
+
+		dbg("tree fell: %s", req.TreeID)
 	}
 
 	return c.JSON(fiber.Map{
@@ -582,14 +644,13 @@ func finishChoppingTree(c *fiber.Ctx) error {
 
 	tree, exists := treesState[req.TreeID]
 	if !exists {
-		// Tree doesn't exist in memory — nothing to clean up, treat as success
 		return c.JSON(fiber.Map{"success": true, "tree_state": "idle", "current_hp": 100})
 	}
 
 	delete(tree.DamageMap, wallet)
 	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
 
-	// If no choppers remain and tree was chopping, revert to idle
+	// Kalau tidak ada chopper lagi, kembalikan ke idle
 	if tree.State == "chopping" && len(tree.DamageMap) == 0 {
 		tree.State = "idle"
 		hub.Broadcast(ws.WSMessage{
@@ -619,21 +680,19 @@ func getTreeState(c *fiber.Ctx) error {
 
 	tree, exists := treesState[treeID]
 	if !exists {
-		return c.JSON(fiber.Map{"tree_id": treeID, "state": "idle"})
+		return c.JSON(fiber.Map{"tree_id": treeID, "state": "idle", "current_hp": 100, "max_hp": 100})
 	}
 
+	// Auto respawn kalau sudah waktunya
 	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
 		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 		hub.Broadcast(ws.WSMessage{
 			Type: "tree_state",
-			Data: map[string]interface{}{
-				"tree_id": treeID,
-				"state":   "idle",
-			},
+			Data: map[string]interface{}{"tree_id": treeID, "state": "idle"},
 		}, "")
-		dbg("tree respawned: %s", treeID)
+		dbg("tree respawned via poll: %s", treeID)
 	}
 
 	resp := fiber.Map{
