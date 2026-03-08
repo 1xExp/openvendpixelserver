@@ -57,7 +57,7 @@ type TreeState struct {
 	State       string         `json:"state"`
 	MaxHP       int            `json:"max_hp"`
 	CurrentHP   int            `json:"current_hp"`
-	DamageMap   map[string]int `json:"damage_map"` // wallet -> total damage
+	DamageMap   map[string]int `json:"damage_map"`
 	RespawnTime time.Time      `json:"respawn_time"`
 }
 
@@ -239,6 +239,16 @@ func handleFiberWebSocket(c *websocket.Conn) {
 			return resolveDisplayName(&p), nil
 		},
 		func(w string) {
+			// On disconnect: remove from any active chop sessions
+			treesLock.Lock()
+			for _, tree := range treesState {
+				if _, ok := tree.DamageMap[w]; ok {
+					delete(tree.DamageMap, w)
+					dbg("removed disconnected player %s from tree %s", w, tree.TreeID)
+				}
+			}
+			treesLock.Unlock()
+
 			db.Model(&Player{}).Where("wallet_address = ?", w).Updates(map[string]interface{}{
 				"is_online":   false,
 				"is_chopping": false,
@@ -370,7 +380,19 @@ func playerHeartbeat(c *fiber.Ctx) error {
 }
 
 func playerDisconnect(c *fiber.Ctx) error {
-	db.Model(&Player{}).Where("wallet_address = ?", c.Locals("wallet")).Updates(map[string]interface{}{
+	wallet := c.Locals("wallet").(string)
+
+	// Remove from any active chop sessions on clean disconnect too
+	treesLock.Lock()
+	for _, tree := range treesState {
+		if _, ok := tree.DamageMap[wallet]; ok {
+			delete(tree.DamageMap, wallet)
+			dbg("removed disconnecting player %s from tree %s", wallet, tree.TreeID)
+		}
+	}
+	treesLock.Unlock()
+
+	db.Model(&Player{}).Where("wallet_address = ?", wallet).Updates(map[string]interface{}{
 		"is_online":   false,
 		"is_chopping": false,
 		"last_seen":   time.Now(),
@@ -429,13 +451,11 @@ func startChoppingTree(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			})
 		}
-		// Sudah bisa respawn
 		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 	}
 
-	// Izinkan join baik saat idle maupun chopping
 	tree.State = "chopping"
 	if _, ok := tree.DamageMap[wallet]; !ok {
 		tree.DamageMap[wallet] = 0
@@ -461,14 +481,14 @@ func chopTreeTick(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
 	type Req struct {
 		TreeID string `json:"tree_id"`
-		Damage int    `json:"damage"` // per-hit damage from client
+		Damage int    `json:"damage"`
 	}
 	req := new(Req)
 	if err := c.BodyParser(req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
 
-	// Server-side validate damage (anti-cheat: max damage per tick = 20)
+	// Anti-cheat: clamp damage per tick
 	damage := req.Damage
 	if damage <= 0 || damage > 20 {
 		damage = 10
@@ -483,8 +503,9 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "tree not being chopped"})
 	}
 
+	// FIX: reject wallets that never called start-chop
 	if _, ok := tree.DamageMap[wallet]; !ok {
-		tree.DamageMap[wallet] = 0
+		return c.Status(403).JSON(fiber.Map{"error": "not authorized to chop this tree"})
 	}
 
 	tree.DamageMap[wallet] += damage
@@ -561,14 +582,25 @@ func finishChoppingTree(c *fiber.Ctx) error {
 
 	tree, exists := treesState[req.TreeID]
 	if !exists {
-		return c.Status(400).JSON(fiber.Map{"error": "tree not found"})
+		// Tree doesn't exist in memory — nothing to clean up, treat as success
+		return c.JSON(fiber.Map{"success": true, "tree_state": "idle", "current_hp": 100})
 	}
 
-	// Player stop chop sebelum pohon tumbang — hapus dari chopper list
 	delete(tree.DamageMap, wallet)
 	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
 
-	dbg("finish-chop: %s left tree %s (hp=%d)", wallet, req.TreeID, tree.CurrentHP)
+	// If no choppers remain and tree was chopping, revert to idle
+	if tree.State == "chopping" && len(tree.DamageMap) == 0 {
+		tree.State = "idle"
+		hub.Broadcast(ws.WSMessage{
+			Type: "tree_state",
+			Data: map[string]interface{}{"tree_id": req.TreeID, "state": "idle"},
+		}, "")
+		dbg("tree reverted to idle (no choppers): %s", req.TreeID)
+	}
+
+	dbg("finish-chop: %s left tree %s (hp=%d, choppers=%d)",
+		wallet, req.TreeID, tree.CurrentHP, len(tree.DamageMap))
 	return c.JSON(fiber.Map{
 		"success":    true,
 		"tree_state": tree.State,
