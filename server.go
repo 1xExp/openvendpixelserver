@@ -53,12 +53,13 @@ type PlayerInventory struct {
 }
 
 type TreeState struct {
-	TreeID      string         `json:"tree_id"`
-	State       string         `json:"state"`
-	MaxHP       int            `json:"max_hp"`
-	CurrentHP   int            `json:"current_hp"`
-	DamageMap   map[string]int `json:"damage_map"`
-	RespawnTime time.Time      `json:"respawn_time"`
+	TreeID        string         `json:"tree_id"`
+	State         string         `json:"state"`
+	MaxHP         int            `json:"max_hp"`
+	CurrentHP     int            `json:"current_hp"`
+	DamageMap     map[string]int `json:"damage_map"`
+	RespawnTime   time.Time      `json:"respawn_time"`
+	RespawnCancel chan struct{}   `json:"-"` // batalkan goroutine respawn lama
 }
 
 var (
@@ -239,13 +240,11 @@ func handleFiberWebSocket(c *websocket.Conn) {
 			return resolveDisplayName(&p), nil
 		},
 		func(w string) {
-			// On disconnect: bersihkan dari DamageMap semua tree aktif
 			treesLock.Lock()
 			for _, tree := range treesState {
 				if _, ok := tree.DamageMap[w]; ok {
 					delete(tree.DamageMap, w)
 					dbg("removed disconnected player %s from tree %s", w, tree.TreeID)
-					// Kalau tidak ada chopper lagi, kembalikan ke idle
 					if tree.State == "chopping" && len(tree.DamageMap) == 0 {
 						tree.State = "idle"
 						hub.Broadcast(ws.WSMessage{
@@ -472,6 +471,11 @@ func startChoppingTree(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			})
 		}
+		// Batalkan goroutine respawn yang mungkin masih pending
+		if tree.RespawnCancel != nil {
+			close(tree.RespawnCancel)
+			tree.RespawnCancel = nil
+		}
 		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
@@ -509,7 +513,6 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
 
-	// Anti-cheat: clamp damage
 	damage := req.Damage
 	if damage <= 0 || damage > 20 {
 		damage = 10
@@ -523,7 +526,6 @@ func chopTreeTick(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "tree not being chopped"})
 	}
 
-	// Tolak wallet yang tidak pernah start-chop
 	if _, ok := tree.DamageMap[wallet]; !ok {
 		return c.Status(403).JSON(fiber.Map{"error": "not authorized to chop this tree"})
 	}
@@ -558,7 +560,6 @@ func chopTreeTick(c *fiber.Ctx) error {
 			}
 			woodRewards[w] = wood
 
-			// Simpan ke DB
 			var inv PlayerInventory
 			err := db.Where("wallet = ? AND item_id = ?", w, "wood1").First(&inv).Error
 			if err == gorm.ErrRecordNotFound {
@@ -570,7 +571,6 @@ func chopTreeTick(c *fiber.Ctx) error {
 			db.Model(&Player{}).Where("wallet_address = ?", w).Update("is_chopping", false)
 			dbg("reward: %s contrib=%.1f%% wood=%d", w, contrib, wood)
 
-			// Kirim tree_fell hanya ke wallet yang dapat reward
 			hub.Send(w, ws.WSMessage{
 				Type: "tree_fell",
 				Data: map[string]interface{}{
@@ -580,13 +580,18 @@ func chopTreeTick(c *fiber.Ctx) error {
 			})
 		}
 
-		// Update state
+		// Batalkan goroutine respawn lama kalau ada
+		if tree.RespawnCancel != nil {
+			close(tree.RespawnCancel)
+		}
+		cancel := make(chan struct{})
+		tree.RespawnCancel = cancel
+
 		tree.State = "stump"
 		tree.RespawnTime = time.Now().Add(10 * time.Second)
 		savedTreeID := req.TreeID
 		tree.DamageMap = make(map[string]int)
 
-		// Broadcast stump ke semua (untuk visual)
 		hub.Broadcast(ws.WSMessage{
 			Type: "tree_state",
 			Data: map[string]interface{}{
@@ -596,24 +601,30 @@ func chopTreeTick(c *fiber.Ctx) error {
 			},
 		}, "")
 
-		// Auto respawn setelah 10 detik via goroutine
+		// Goroutine respawn dengan cancel channel
 		go func() {
-			time.Sleep(10 * time.Second)
-			treesLock.Lock()
-			defer treesLock.Unlock()
-			t, ok := treesState[savedTreeID]
-			if ok && t.State == "stump" && time.Now().After(t.RespawnTime) {
-				t.State = "idle"
-				t.CurrentHP = t.MaxHP
-				t.DamageMap = make(map[string]int)
-				hub.Broadcast(ws.WSMessage{
-					Type: "tree_state",
-					Data: map[string]interface{}{
-						"tree_id": savedTreeID,
-						"state":   "idle",
-					},
-				}, "")
-				dbg("tree respawned: %s", savedTreeID)
+			select {
+			case <-time.After(10 * time.Second):
+				treesLock.Lock()
+				defer treesLock.Unlock()
+				t, ok := treesState[savedTreeID]
+				// Hanya respawn kalau masih stump dan cancel channel sama (tidak dibatalkan)
+				if ok && t.State == "stump" && t.RespawnCancel == cancel {
+					t.State = "idle"
+					t.CurrentHP = t.MaxHP
+					t.DamageMap = make(map[string]int)
+					t.RespawnCancel = nil
+					hub.Broadcast(ws.WSMessage{
+						Type: "tree_state",
+						Data: map[string]interface{}{
+							"tree_id": savedTreeID,
+							"state":   "idle",
+						},
+					}, "")
+					dbg("tree respawned: %s", savedTreeID)
+				}
+			case <-cancel:
+				dbg("tree respawn cancelled: %s", savedTreeID)
 			}
 		}()
 
@@ -650,7 +661,6 @@ func finishChoppingTree(c *fiber.Ctx) error {
 	delete(tree.DamageMap, wallet)
 	db.Model(&Player{}).Where("wallet_address = ?", wallet).Update("is_chopping", false)
 
-	// Kalau tidak ada chopper lagi, kembalikan ke idle
 	if tree.State == "chopping" && len(tree.DamageMap) == 0 {
 		tree.State = "idle"
 		hub.Broadcast(ws.WSMessage{
@@ -683,8 +693,12 @@ func getTreeState(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"tree_id": treeID, "state": "idle", "current_hp": 100, "max_hp": 100})
 	}
 
-	// Auto respawn kalau sudah waktunya
 	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
+		// Batalkan goroutine respawn karena kita handle di sini
+		if tree.RespawnCancel != nil {
+			close(tree.RespawnCancel)
+			tree.RespawnCancel = nil
+		}
 		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
