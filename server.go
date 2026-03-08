@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"math/rand"
 	"os"
 	"regexp"
 	"strings"
@@ -431,7 +430,7 @@ func startChoppingTree(c *fiber.Ctx) error {
 			})
 		}
 		// Sudah bisa respawn
-		tree.State     = "idle"
+		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 	}
@@ -462,11 +461,19 @@ func chopTreeTick(c *fiber.Ctx) error {
 	wallet := c.Locals("wallet").(string)
 	type Req struct {
 		TreeID string `json:"tree_id"`
+		Damage int    `json:"damage"` // per-hit damage from client
 	}
 	req := new(Req)
 	if err := c.BodyParser(req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request"})
 	}
+
+	// Server-side validate damage (anti-cheat: max damage per tick = 20)
+	damage := req.Damage
+	if damage <= 0 || damage > 20 {
+		damage = 10
+	}
+	dbg("chop-tick: wallet=%s tree=%s damage=%d", wallet, req.TreeID, damage)
 
 	treesLock.Lock()
 	defer treesLock.Unlock()
@@ -477,10 +484,9 @@ func chopTreeTick(c *fiber.Ctx) error {
 	}
 
 	if _, ok := tree.DamageMap[wallet]; !ok {
-		return c.Status(400).JSON(fiber.Map{"error": "not chopping this tree"})
+		tree.DamageMap[wallet] = 0
 	}
 
-	damage := rand.Intn(3) + 1
 	tree.DamageMap[wallet] += damage
 	tree.CurrentHP -= damage
 	if tree.CurrentHP < 0 {
@@ -488,7 +494,7 @@ func chopTreeTick(c *fiber.Ctx) error {
 	}
 
 	fell := tree.CurrentHP <= 0
-	woodRewards := make(map[string]int) // wallet -> wood reward
+	woodRewards := make(map[string]int)
 
 	if fell {
 		totalDamage := 0
@@ -517,9 +523,9 @@ func chopTreeTick(c *fiber.Ctx) error {
 			db.Model(&Player{}).Where("wallet_address = ?", w).Update("is_chopping", false)
 			dbg("reward: %s contrib=%.1f%% wood=%d", w, contrib, wood)
 		}
-		tree.State       = "stump"
+		tree.State = "stump"
 		tree.RespawnTime = time.Now().Add(10 * time.Second)
-		tree.DamageMap   = make(map[string]int)
+		tree.DamageMap = make(map[string]int)
 		hub.Broadcast(ws.WSMessage{
 			Type: "tree_state",
 			Data: map[string]interface{}{
@@ -528,6 +534,7 @@ func chopTreeTick(c *fiber.Ctx) error {
 				"respawn_at": tree.RespawnTime.Unix(),
 			},
 		}, "")
+		dbg("pine tree fell: %s", req.TreeID)
 	}
 
 	return c.JSON(fiber.Map{
@@ -535,7 +542,7 @@ func chopTreeTick(c *fiber.Ctx) error {
 		"current_hp":  tree.CurrentHP,
 		"max_hp":      tree.MaxHP,
 		"fell":        fell,
-		"wood_reward": woodRewards[wallet], // 0 jika belum tumbang atau tidak dapat reward
+		"wood_reward": woodRewards[wallet],
 	})
 }
 
@@ -584,7 +591,7 @@ func getTreeState(c *fiber.Ctx) error {
 	}
 
 	if tree.State == "stump" && time.Now().After(tree.RespawnTime) {
-		tree.State     = "idle"
+		tree.State = "idle"
 		tree.CurrentHP = tree.MaxHP
 		tree.DamageMap = make(map[string]int)
 		hub.Broadcast(ws.WSMessage{
